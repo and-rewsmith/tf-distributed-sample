@@ -1,10 +1,9 @@
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import tensorflow as tf
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 # Define the multi-worker strategy
 strategy = tf.distribute.MultiWorkerMirroredStrategy()
-assert tf.config.list_physical_devices('GPU')
 
 # Function to create and shard the dataset across workers
 
@@ -34,7 +33,8 @@ def dataset_fn(input_context):
 
 def build_model():
     model = tf.keras.Sequential([
-        tf.keras.layers.Flatten(input_shape=(28, 28)),
+        tf.keras.layers.Input(shape=(28, 28)),
+        tf.keras.layers.Flatten(),
         tf.keras.layers.Dense(128, activation='relu'),
         tf.keras.layers.Dense(10, activation='softmax')
     ])
@@ -44,14 +44,37 @@ def build_model():
 # Using the strategy scope
 with strategy.scope():
     model = build_model()
-    model.compile(optimizer='adam',
-                  loss='sparse_categorical_crossentropy',
-                  metrics=['accuracy'])
+    loss_object = tf.keras.losses.SparseCategoricalCrossentropy()
+    optimizer = tf.keras.optimizers.Adam()
+
+    # Metrics to monitor loss and accuracy
+    train_loss = tf.keras.metrics.Mean(name='train_loss')
+    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
 
     # Distribute the dataset across the workers
-    dataset = strategy.experimental_distribute_datasets_from_function(dataset_fn)
+    dataset = strategy.distribute_datasets_from_function(dataset_fn)
 
-    log_dir = "./logs/fit/"
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+    # Define the train step
+    @tf.function
+    def train_step(inputs):
+        features, labels = inputs
 
-    model.fit(dataset, epochs=5, callbacks=[tensorboard_callback])
+        with tf.GradientTape() as tape:
+            predictions = model(features, training=True)
+            loss = loss_object(labels, predictions)
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+        train_loss(loss)
+        train_accuracy(labels, predictions)
+
+    # Training loop
+    EPOCHS = 5
+    for epoch in range(EPOCHS):
+        train_loss.reset_states()
+        train_accuracy.reset_state()
+
+        for batch_data in dataset:
+            strategy.run(train_step, args=(batch_data,))
+
+        print(f'Epoch {epoch+1}, Loss: {train_loss.result()}, Accuracy: {train_accuracy.result() * 100}')
