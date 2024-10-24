@@ -1,7 +1,10 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import tensorflow as tf
 
 # Define the multi-worker strategy
 strategy = tf.distribute.MultiWorkerMirroredStrategy()
+assert tf.config.list_physical_devices('GPU')
 
 # Function to create and shard the dataset across workers
 
