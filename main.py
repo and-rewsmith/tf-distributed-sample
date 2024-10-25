@@ -1,121 +1,50 @@
+import json
 import tensorflow as tf
 import os
+import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-# Define the multi-worker strategy
-strategy = tf.distribute.MultiWorkerMirroredStrategy()
 
-# Function to create the dataset
-
-
-def make_dataset():
+def mnist_dataset(batch_size):
     (x_train, y_train), _ = tf.keras.datasets.mnist.load_data()
-    dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
-    dataset = dataset.shuffle(10000)
-    return dataset
-
-# Function to shard the dataset based on the worker index
-
-
-def dataset_fn(input_context):
-    global_batch_size = 64
-    per_replica_batch_size = input_context.get_per_replica_batch_size(global_batch_size)
-
-    # Create the base dataset without batching
-    dataset = make_dataset()
-
-    # Shard the dataset across workers
-    dataset = dataset.shard(
-        input_context.num_input_pipelines,
-        input_context.input_pipeline_id
-    )
-
-    # Preprocess, batch, and prefetch
-    dataset = dataset.map(
-        lambda x, y: (tf.cast(x, tf.float32) / 255.0, y),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-    dataset = dataset.batch(per_replica_batch_size)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-
-    return dataset
-
-# Build a simple Keras model
+    # The `x` arrays are in uint8 and have values in the [0, 255] range.
+    # You need to convert them to float32 with values in the [0, 1] range.
+    x_train = x_train / np.float32(255)
+    y_train = y_train.astype(np.int64)
+    train_dataset = tf.data.Dataset.from_tensor_slices(
+        (x_train, y_train)).shuffle(60000).repeat().batch(batch_size)
+    return train_dataset
 
 
-def build_model():
+def build_and_compile_cnn_model():
     model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(28, 28)),
+        tf.keras.layers.InputLayer(input_shape=(28, 28)),
+        tf.keras.layers.Reshape(target_shape=(28, 28, 1)),
+        tf.keras.layers.Conv2D(32, 3, activation='relu'),
         tf.keras.layers.Flatten(),
         tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dense(10, activation='softmax')
+        tf.keras.layers.Dense(10)
     ])
+    model.compile(
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        optimizer=tf.keras.optimizers.SGD(learning_rate=0.001),
+        metrics=['accuracy'])
     return model
 
 
-# Using the strategy scope
+per_worker_batch_size = 64
+tf_config = json.loads(os.environ['TF_CONFIG'])
+num_workers = len(tf_config['cluster']['worker'])
+
+strategy = tf.distribute.MultiWorkerMirroredStrategy()
+
+global_batch_size = per_worker_batch_size * num_workers
+multi_worker_dataset = mnist_dataset(global_batch_size)
+
 with strategy.scope():
-    model = build_model()
-    loss_object = tf.keras.losses.SparseCategoricalCrossentropy()
-    optimizer = tf.keras.optimizers.Adam()
-
-    # Metrics to monitor loss and accuracy
-    train_loss = tf.keras.metrics.Mean(name='train_loss')
-    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
-        name='train_accuracy'
-    )
-
-# Distribute the dataset across the workers
-dataset = strategy.distribute_datasets_from_function(dataset_fn)
-
-# Define the train step
+    # Model building/compiling need to be within `strategy.scope()`.
+    multi_worker_model = build_and_compile_cnn_model()
 
 
-@tf.function
-def train_step(inputs):
-    features, labels = inputs
-
-    with tf.GradientTape() as tape:
-        predictions = model(features, training=True)
-        loss = loss_object(labels, predictions)
-
-    gradients = tape.gradient(loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-
-    train_loss(loss)
-    train_accuracy(labels, predictions)
-
-# Function to print shapes in a distributed context
-
-
-def print_batch_shapes(features, labels):
-    def _print_local_shapes(ctx):
-        print(f"Replica {ctx.replica_id_in_sync_group} shapes - "
-              f"Features: {features.shape}, Labels: {labels.shape}")
-    strategy.run(_print_local_shapes, args=())
-
-
-# Training loop
-EPOCHS = 5
-
-for epoch in range(EPOCHS):
-    train_loss.reset_state()
-    train_accuracy.reset_state()
-
-    for batch_data in dataset:
-        # Debug print for batch shapes using strategy.run
-        features, labels = batch_data
-        # strategy.run(lambda x, y: tf.print(
-        #     "Per-replica shapes:",
-        #     "features=", tf.shape(x),
-        #     "labels=", tf.shape(y)
-        # ), args=(features, labels))
-
-        strategy.run(train_step, args=(batch_data,))
-
-    print(
-        f'Epoch {epoch+1}, '
-        f'Loss: {train_loss.result():.4f}, '
-        f'Accuracy: {train_accuracy.result() * 100:.2f}%'
-    )
+multi_worker_model.fit(multi_worker_dataset, epochs=3, steps_per_epoch=70)
