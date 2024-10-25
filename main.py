@@ -8,12 +8,13 @@ os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 def mnist_dataset(batch_size):
     (x_train, y_train), _ = tf.keras.datasets.mnist.load_data()
-    # The `x` arrays are in uint8 and have values in the [0, 255] range.
-    # You need to convert them to float32 with values in the [0, 1] range.
-    x_train = x_train / np.float32(255)
-    y_train = y_train.astype(np.int64)
+    x_train = tf.cast(x_train, tf.float32) / 255.0
+    y_train = tf.cast(y_train, tf.int64)
+
     train_dataset = tf.data.Dataset.from_tensor_slices(
-        (x_train, y_train)).shuffle(60000).repeat().batch(batch_size)
+        (x_train, y_train)
+    ).shuffle(60000).repeat().batch(batch_size)
+
     return train_dataset
 
 
@@ -26,10 +27,20 @@ def build_and_compile_cnn_model():
         tf.keras.layers.Dense(128, activation='relu'),
         tf.keras.layers.Dense(10)
     ])
+
+    # Explicitly use legacy optimizer
+    optimizer = tf.keras.optimizers.legacy.SGD(learning_rate=0.001)
+
+    loss = tf.keras.losses.SparseCategoricalCrossentropy(
+        from_logits=True,
+        reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE
+    )
+
     model.compile(
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        optimizer=tf.keras.optimizers.SGD(learning_rate=0.001),
-        metrics=['accuracy'])
+        optimizer=optimizer,
+        loss=loss,
+        metrics=['accuracy']
+    )
     return model
 
 
@@ -43,8 +54,12 @@ global_batch_size = per_worker_batch_size * num_workers
 multi_worker_dataset = mnist_dataset(global_batch_size)
 
 with strategy.scope():
-    # Model building/compiling need to be within `strategy.scope()`.
     multi_worker_model = build_and_compile_cnn_model()
 
+# Remove the optimizer.build call since it's not needed with legacy optimizer
 
-multi_worker_model.fit(multi_worker_dataset, epochs=3, steps_per_epoch=70)
+multi_worker_model.fit(
+    multi_worker_dataset,
+    epochs=3,
+    steps_per_epoch=70
+)
